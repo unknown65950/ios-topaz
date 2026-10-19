@@ -1,3 +1,95 @@
+# iOS 16 on topaz (Redmi Note 12 4G, SM6225 "khaje") - agent handoff
+
+> The sweet (Redmi Note 10 Pro, SM7150) log inherited from dipa-studio/ios-sweet starts at the
+> "# iOS 16 on sweet ..." header below. Everything above that header is about THIS port.
+
+## >>> ACTIVE HANDOFF 2026-10-20: README steps 1-4 done, waiting for the phone <<<
+
+**Goal.** XNU + the unmodified iPhone X iOS 16.7.16 (20H392) userland on the user's Redmi Note 12 4G
+(`topaz`, SM6225), root filesystem in `userdata`, kernel started from RAM with `fastboot boot`.
+
+**Repo.** origin `MakrSas/ios-topaz` (the user has read-only access there), branch `topaz`, HEAD
+`590f001` (xnu 0126). All work goes to the fork **`unknown65950/ios-topaz`**: its `topaz` is
+`014d21e` = HEAD + one empty commit ("ci: register fork workflows"), needed to register `xnu.yml` for
+`workflow_dispatch` (forks have Actions dormant until a push; `workflow_dispatch` on `topaz` is the
+working path because the workflow's `push` trigger only watches `main`). Local clone:
+`/home/unknown/Документы/ios-topaz`, git identity `unknown65950 <unknown65950@users.noreply.github.com>`.
+
+**Artifacts (all local; none of this is in git).** Work dir `/home/unknown/Документы/ios-work`.
+
+| What | Path | Size | sha256 (prefix) |
+| --- | --- | --- | --- |
+| Kernel (CI run 39313254445) | `ios-topaz/xnu/out/kernel.development.sweet` | 17,777,928 | `804a949f39ed150e` |
+| Device tree (`mkadt.py --highmem`) | `ios-topaz/shim/out/topaz.adt` | 9,496 | - |
+| iOS root, HFS+ 16 GiB | `ios-work/ios16-root.img` | 17,179,869,184 | `2714cfbafd86686a` |
+| iOS root, sparse (for `fastboot flash`) | `ios-work/ios16-root.simg` | 12,145,394,032 | `149790aa0225193af9` |
+| Boot image, kernel console ON | `ios-topaz/shim/out/shim-boot-console.img` | 17,358,848 | `4fb7c99498cb6ca0` |
+| Boot image, `sweetfb_noconsole=1` | `ios-topaz/shim/out/shim-boot-noconsole.img` | 17,358,848 | `ac1d647bc77b386a` |
+| OrangeFox, temp-boot safety net | `ios-work/recovery/OrangeFox-R12.0-Unofficial-topaz.img` | 104,857,600 | `813b5c4b20452e9d` |
+
+Both boot images: Android boot header **v4**, `kernel_size` 17,350,176 (= shim `Image` with the
+payload appended after `_end`; `image_size` == file size so ABL copies it whole), cmdline
+`console=null`; the shim payload = kernel + ADT + boot-args. Root image built from the user's
+`~/Загрузки/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw` (d22ap, Customer Erase): the real
+`d22ap.adt` was extracted to `ios-topaz/research/ipsw-x/` (gitignored, 186,084 B) and feeds
+`mkadt.py --highmem`. `tools/mkiosroot.sh` + `tools/sweet-root-tweaks.py` were run (fsck OK; 7x
+`_PanicOnCrasX`, CommCenter jobs removed, containers created, VirtualAudio/MediaToolbox/Setup/
+SpringBoard prefs, migration `LastSystemVersion`). `fsck.hfsplus` needs `PATH=/usr/sbin` prepended,
+and `hfsprogs` came from the Debian **non-free** pool .deb.
+
+**Boot-args inside the images** (README step 3): `debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress
+rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1
+launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60` (the noconsole image appends
+`sweetfb_noconsole=1 sweetfb_hz=30`). `shim/build.sh` needs `MKBOOTIMG=/home/unknown/Документы/
+ios-work/mkbootimg/mkbootimg.py` (AOSP `platform/system/tools/mkbootimg`, header v4).
+
+**Phone state (the USER's phone, not the maintainer's s8build box).** Redmi Note 12 4G `topaz`,
+currently running **RisingOS Revived 7.1** (custom ROM in `super`). It has not been connected to this
+machine yet, so **nothing has been flashed**; steps 1-4 wrote only local/CI artifacts.
+**`topaz` is the device codename but Xiaomi ships its firmware as `tapas_*`** - RECOVERY.md says
+"`topaz`, ROM codename `tapas`" and notes the stock script checks `product == tapas` while the
+bootloader answers `topaz`. So `tapas_global_images_OS2.0.208.0.VMTMIXM_20260720.0000.00_15.0_global_
+322325af29.tgz` on `bigota.d.miui.com` (7,167,258,409 B, MD5 `322325af295dd7cc47e733dafbc63b9c`) **is
+the correct stock ROM for this phone**. Not downloaded on this machine (the phone already has Android
+in `super`, so a return to Android is a `userdata` format, not a reflash).
+
+**Write risk, exactly as documented.** `xnu/patches/0088-topaz-gpt-watchdog.patch` only *fences* LUN0:
+it rejects writes at LBA < 6 and at the backup-GPT tail, remembers the primary and backup GPT header
+CRCs, and a thread re-reads them every 10 s and panics on any change. It does not fix the UFS only bug
+(2026-10-18/19: the driver destroyed the LUN0 GPT - super, userdata, persist, esp, win - and ABL could
+then boot nothing). So RECOVERY.md's rule stands: **take a fresh LUN0 GPT dump before every iOS
+test**, and only then boot with `ufsrw=1 rootrw=1`. The maintainer's own GPT files
+(`gpt_both0_20261001.bin`, `gpt_both4_20260930.bin`) are for their esp/win layout, NOT for this
+phone - take fresh dumps here. The OrangeFox image's sha256 matches its release's `sha256sums.txt`
+and the ramdisk is genuinely built for topaz (`fox/out/target/product/topaz`, goodix/focaltech touch
+`.ko`); note `kernel_size` is 0 (ramdisk-only), so `fastboot boot` of it may be refused - then flash it
+to `recovery_a` or use the ROM's own recovery.
+
+**Next steps (in order), all waiting on the user plugging the phone in:**
+1. `fastboot getvar all` (topaz allows it - the sweet-era "NEVER getvar" does NOT apply) -> the real
+   `product`, `current-slot` and `partition-size:` of userdata/super/persist/esp/win -> confirms the
+   GPT is intact and that 16 GiB fits `userdata`.
+2. Gain root to dump the GPT: first try `adb shell su -c id` (RisingOS is often rooted) -> `dd` LUN0
+   head (first 1 MiB) + tail (last 1 MiB) and `persist`/`modem`; otherwise temp-boot OrangeFox.
+   `mkgptboth.py HEAD TAIL OUT` rebuilds a flashable `gpt_both0.bin` from head+tail dumps.
+3. `fastboot -S 512M flash userdata ios-work/ios16-root.simg` (~5 min, do not unplug; the userdata
+   contents = the RisingOS install's data are destroyed by design).
+4. `fastboot boot ios-topaz/shim/out/shim-boot-console.img` (console variant first - it is the
+   debugging image). Expected: the iOS lock screen in ~3 min on the 4 Gold cores, CPU rendering only,
+   1080x2400 presented as an iPhone X panel.
+
+**Verified on this machine (observations):** CI run `39313254445` succeeded; the kernel is Mach-O
+arm64 with 0 LSE/LDAPR instructions and contains `SWEET UFS`, `SWEET FB`, `SWEET TOUCH`, `TopazModem`
+strings; the boot-header v4 fields above; all sha256s above; the OrangeFox ramdisk contents.
+**Guesses (not verified):** that a RisingOS install leaves `boot`/`vendor_boot`/GPT untouched by our
+steps (it should - we write only `userdata`), and whether this phone has a working recovery/root yet.
+**Tooling installed on this machine:** `ipsw` 3.1.739 and `gh` 2.102.0 in `~/.local/bin` (not on the
+default PATH), `apfs-fuse` in `/usr/local/bin`, `mkfs.hfsplus`/`fsck.hfsplus` in `/usr/sbin`,
+`img2simg`/`simg2img`, `lz4`, `gcc-aarch64-linux-gnu`, `fastboot` (34.0.5);
+`/etc/sudoers.d/99-agent` grants the user NOPASSWD sudo (`sudo rm` that file to revert).
+
+---
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)
