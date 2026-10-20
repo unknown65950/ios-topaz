@@ -3,6 +3,57 @@
 > The sweet (Redmi Note 10 Pro, SM7150) log inherited from dipa-studio/ios-sweet starts at the
 > "# iOS 16 on sweet ..." header below. Everything above that header is about THIS port.
 
+## >>> 2026-10-20 (later): user asked about switching to topaz-woa - blocked by the same bug <<<
+
+The user proposed moving to <https://github.com/MakrSas/topaz-woa> (Windows 11 ARM64 on the same
+`topaz` phone, status 2026-10-04: boots to the desktop). **Assessed and NOT started: its two core
+mechanisms are exactly the two things that are broken on this phone right now.**
+
+1. `topaz-woa` boots UEFI **from RAM via `fastboot boot`** ("Boot to desktop (UEFI from RAM via
+   `fastboot boot`) - works"). On this phone `fastboot boot` is **permanently broken**:
+   - 1024 B / 512 B garbage: `cannot load ...: too short` (host-side, not informative)
+   - 65536 B / 1 MiB / 4 MiB / 8 MiB garbage: `Failed to load/authenticate boot image: **Bad Buffer Size**`
+   - 98 MiB (`vendor_boot.img`): `Failed to load/authenticate boot image: **Invalid Parameter**`
+   The size thresholds rule out "the image is garbage": 8 MiB fails on buffer size while 98 MiB fails
+   on parameter validation, i.e. ABL's RAM allocation for the download/boot staging area is failing
+   *before* it ever looks at the image. `max-download-size` correctly reports `771751936`, so the
+   fastboot transport is fine - the failure is ABL-side.
+2. `topaz-woa` is a **dual-boot by slot** project: "`uefi/` builds the Mu-Silicium UEFI for `boot_b`"
+   and "Android stays on slot A (dual boot by slot)". It requires switching slots with
+   `fastboot set_active`. On this phone **ABL boots a recovery image whichever slot is active**
+   (verified `a` and `b`, all `successful`/`unbootable` combinations) - so the slot switch that
+   `topaz-woa` depends on does not currently take effect either.
+
+**Conclusion: switching to `topaz-woa` is not possible until the phone's boot problem is fixed.** It is
+not a workaround for it - it is blocked by the very same bug. Fixing the boot is a prerequisite for
+*both* projects.
+
+**New evidence added this round (worth keeping):** `slot-retry-count:b` **decreases by exactly 1 per
+boot attempt** (7 -> 6 -> 5 -> 4 observed). That proves ABL *is* trying `boot_b`, failing, counting the
+failure and falling back to recovery - so this is a **genuine boot failure inside the system/kernel
+path**, not a stuck-button/stuck-mode decision made before the disk is read. `pstore` is empty, so the
+system kernel dies before ramoops is initialised (no crash log survives). Also: the fully consistent
+stock slot-`b` set (`boot`+`init_boot`+`vendor_boot`+`dtbo`+`vbmeta`, all from the OTA payload) was
+flashed and behaves identically, so partition *content* is still excluded.
+
+### Cheap check that needs the user (30 seconds, do this first)
+
+The one thing never tested because it needs hands on the phone: **boot with the volume keys firmly
+held away from their contacts**, and watch whether `bootinfo.pureason` finally changes from
+`0x40041`. The retry counter evidence makes a stuck key unlikely, but it is free to check.
+
+### If the user wants Windows on topaz (path once booting is fixed)
+
+`topaz-woa` is a real, far-along project (GPU/DWM, touch, Wi-Fi, audio all working). Plan:
+1. Clone the repo and build with `uefi/build_topaz_uefi.sh` (produces the v4 UEFI image; **"Xiaomi ABL
+   ignores v1"**, hence `uefi/mu_v4pack.sh`).
+2. UEFI is **RAM-only** via `fastboot boot` - needs mechanism 1 above working, or must be flashed into
+   `boot_b` instead (the repo's alternative) which needs mechanism 2 (slot switch) working.
+3. Windows itself installs from a flash drive / OTG hub (see `docs/WINDOWS_USB_AND_INSTALL.md`).
+4. Android lives on slot `a` - the iOS root in `userdata` would be lost unless backed up first.
+
+---
+
 ## >>> ACTIVE HANDOFF 2026-10-20 (late): Android will not boot, ABL always loads recovery <<<
 
 **Read this first.** The phone's Android install does NOT currently boot, and the cause is in the
