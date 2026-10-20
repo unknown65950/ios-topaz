@@ -65,18 +65,83 @@ and the ramdisk is genuinely built for topaz (`fox/out/target/product/topaz`, go
 `.ko`); note `kernel_size` is 0 (ramdisk-only), so `fastboot boot` of it may be refused - then flash it
 to `recovery_a` or use the ROM's own recovery.
 
-**Next steps (in order), all waiting on the user plugging the phone in:**
-1. `fastboot getvar all` (topaz allows it - the sweet-era "NEVER getvar" does NOT apply) -> the real
-   `product`, `current-slot` and `partition-size:` of userdata/super/persist/esp/win -> confirms the
-   GPT is intact and that 16 GiB fits `userdata`.
-2. Gain root to dump the GPT: first try `adb shell su -c id` (RisingOS is often rooted) -> `dd` LUN0
-   head (first 1 MiB) + tail (last 1 MiB) and `persist`/`modem`; otherwise temp-boot OrangeFox.
-   `mkgptboth.py HEAD TAIL OUT` rebuilds a flashable `gpt_both0.bin` from head+tail dumps.
-3. `fastboot -S 512M flash userdata ios-work/ios16-root.simg` (~5 min, do not unplug; the userdata
-   contents = the RisingOS install's data are destroyed by design).
-4. `fastboot boot ios-topaz/shim/out/shim-boot-console.img` (console variant first - it is the
-   debugging image). Expected: the iOS lock screen in ~3 min on the 4 Gold cores, CPU rendering only,
-   1080x2400 presented as an iPhone X panel.
+### FIRST PHONE RUN 2026-10-20 (steps 1-4 executed; iOS did not reach the GUI)
+
+**The USER's phone (not the maintainer's s8build box).** `topaz_global`, model `23021RAA2Y`, adb serial
+`d6915085`, was running **RisingOS Revived** (Android 15, `lineage_topaz-userdata 15 BP1A.250505.005`,
+active slot **b**), rooted with **Magisk** (`/product/bin/su`; `adb root` was disabled, `su -c id`
+works after tapping Allow). No `esp`/`win` partitions - stock layout, unlike the maintainer's phone.
+
+**Safety backup taken first, read-only** (`/home/unknown/Документы/ios-work/backup-20261020`, 67 MiB,
+29 files + `SHA256SUMS` + `README.md`): for every LUN `sda`..`sdf` the first and last 1 MiB plus the
+concatenated `sdX.gpt-both.bin` (= the `mkgptboth.py HEAD TAIL OUT` input format), and `persist`,
+`modemst1/2`, `fsg`, `fsc`, `devinfo`, `frp`, `keystore`. All six GPTs verified: primary and backup
+headers and the partition-entry arrays are identical, every CRC matches.
+**The LUN logical block size is 4096, not 512** - the GPT header is at offset 4096 (LBA1) and the
+backup in the last 4096-byte block of the LUN. Any GPT tooling here must use that (RECOVERY.md's
+`gptdump.py`/`mkgptboth.py` were written for their own dumps).
+LUN map: `sda`=LUN0 125,736,845,312 B (userdata=sda19, super=sda9, persist=sda2, cust, rescue,
+vbmeta_system) - `sdb`/`sdc`=xbl A/B 8 MiB - `sdd`=LUN3 32 MiB - `sde`=LUN4 2 GiB (boot/vendor_boot/
+dtbo/recovery/firmware A/B, 96 entries) - `sdf`=LUN5 16 MiB (modemst1/2, fsg, fsc).
+
+**Flashing and booting (both succeeded).** `fastboot -S 512M flash userdata ios16-root.simg` = 24/24
+chunks OK in 400 s. `fastboot boot shim/out/shim-boot-console.img` = "Sending 16952 KB OKAY (109 s),
+Booting OKAY". `userdata` was 115,229,929,472 B before and after -> the 16 GiB image fits with 91 GiB
+to spare; `partition-size:userdata|super|persist|cust|rescue` all answer after the iOS session, so
+**the GPT survived** and the patch-0088 watchdog never fired (no GPT write happened this run).
+
+**WHERE IT STOPS: the screen keeps the kernel console text and freezes on the last line
+`exec donotdistribut...`, with NO Apple logo and NO progress bar at any point.** `exec NAME` is patch
+0042's per-exec log (`printf("exec %s\n", p->p_name)`) and `p_name`/`p_comm` is truncated to ~16
+chars, so the line is the launch of
+`/System/Library/DoNotDisturb/ClientBundles/com.apple.donotdisturb.private.app-launch.bundle/com.apple
+.donotdisturb.private.app-launch`. There is no file or string `donotdistribut*` anywhere in the root
+image (checked by filename on the mounted image and by `grep -a` over the 16 GiB image) - it is purely
+the truncated process name of that DND client bundle, NOT an error message. No logo means the stop is
+**before iOS paints anything** (i.e. before backboardd/SpringBoard get to CoreAnimation), which is
+earlier than sweet's bring-up got.
+
+**The HFS+ root is healthy and was actually mounted read-write:** volume header attributes
+`0x80002000` (journaled), `lastMountedVersion` **`HFSJ`** (not the "dirty" `10.0`), blockSize 4096,
+4,194,304 blocks (16.00 GiB), 184,228 files, 4.24 GiB free, checkedDate 2026-10-19 19:43:58. So the
+UFS driver and the HFS+ driver both work on this phone; the stop is in userland/bring-up, not on disk.
+
+**Finding: the sweet persistent console log (patch 0047, `SWEETLOG`) does NOT work on topaz.** The last
+1025 blocks of `userdata` (4 MiB + 4 KiB, `UFS_BLOCK` 4096) hold HFS+ data, not the ring - there is no
+`SWEETLOG` header (searched the last 64 MiB, and the whole image for the string). The kernel does carry
+the `SWEETLOG`/`SWEET LOG: console log to the last %u KiB` strings, so the patch is compiled in, but the
+ring never got written: either `sweet_log_start()` never ran or the thread stopped before its first
+`ufs_write_blocks`. **This is a first-class thing to fix** - it is the only way to read the log on a
+phone whose only console is the panel, and its absence is why this run had to be diagnosed from a photo.
+
+**Recovery path that works on this phone (no flashing).** `fastboot boot
+ios-work/recovery/OrangeFox-R12.0-Unofficial-topaz.img` prints
+`Booting FAILED (Status read failed (No such device))` but the phone **does** come up in OrangeFox
+(`adb devices` -> `d6915085 recovery`, `adbd is already running as root`, `userdata` =
+`/dev/block/sda19`). The image is ramdisk-only (`kernel_size` 0) and topaz's ABL boots it anyway. This
+is the way to `dd` from LUN0 without flashing anything.
+
+**Diagnosis method that did NOT help:** reading the console ring from recovery (see above - never
+flushed). `fastboot getvar all` works fine on topaz (the sweet-era "NEVER fastboot getvar" does not
+apply to this device).
+
+**Next steps (in order):**
+1. Boot the `sweetfb_noconsole=1 sweetfb_hz=30` image (`shim-boot-noconsole.img`): the console leaves
+   the panel after the first iOS frame, so if the screen stays black the stop really is before any
+   paint, and if a logo appears we know how far it gets. (Chosen to run next.)
+2. Isolate `exec donotdistribut...`: find which job pulls in the DND client bundle so early. Suspect
+   launchd bringing up the whole `System/Library/LaunchDaemons` set in parallel and blocking on a
+   daemon whose IPC never answers (in sweet the analogous hangs were synchronous XPC to a daemon that
+   could not run - e.g. `-[VMVoicemailManager fetchAccounts]` waiting on the modem, and
+   `BKSSystemShellService _checkIn` waiting on backboardd).
+3. Fix the persistent log for topaz (patch 0047 path) - without it every phone run costs a photo and a
+   guess. Then the ring gives the real last lines, including anything after `exec`.
+4. Only after the log works, chase the bring-up order (which daemon blocks, and on what).
+
+**Guesses (clearly not verified):** that `exec donotdistribut...` is a *hang* rather than the last line
+before a long silent stretch (the console simply may not print again - patch 0042 only prints on exec);
+and that the stop is a daemon dependency (BSSystemShellService-style check-in) rather than a missing
+iOS feature. Both need the log to settle.
 
 **Verified on this machine (observations):** CI run `39313254445` succeeded; the kernel is Mach-O
 arm64 with 0 LSE/LDAPR instructions and contains `SWEET UFS`, `SWEET FB`, `SWEET TOUCH`, `TopazModem`
