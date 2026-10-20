@@ -143,6 +143,71 @@ before a long silent stretch (the console simply may not print again - patch 004
 and that the stop is a daemon dependency (BSSystemShellService-style check-in) rather than a missing
 iOS feature. Both need the log to settle.
 
+### SECOND RUN (no console) 2026-10-20: iOS DOES paint, then keeps running (correction)
+
+`fastboot boot shim/out/shim-boot-noconsole.img` (sha256 `ac1d647bc77b386a`). **The screen went dark
+(the console left the panel because iOS presented a frame) and then the kernel text came back and moved
+on**; the last line the user read was
+`SWEET AKS: securityd set 10 arg0 0 in 2/32 out1/40 -> 0xc00002c7`. So:
+- the earlier "stops before any paint" reading was WRONG - iOS does reach CoreAnimation presentation,
+  and patch 0042's `exec NAME` lines are just per-exec noise (the DND client bundle is one of many),
+  not the stopping point. Correcting this matters for whoever picks this up next.
+- iOS userland gets at least as far as **securityd calling AppleKeyStore**. `SWEET AKS: ... -> 0x...` is
+  patch 0038's per-selector trace; `0xc00002c7` is an IOReturn-style failure (0xc0000000 | 0x2c7) and
+  the `default:` arm of `sweet_aks_external_method` returns `kIOReturnUnsupported` there, i.e. selector
+  10 with those argument sizes is simply not implemented - a normal "no such operation", not a panic.
+  **Unverified:** whether securityd *waits* on that answer (blocking the boot) or just logs it.
+- Nothing crashed: no panic, no watchdog, no GPT change (checked `partition-size:` for userdata/super/
+  persist/cust/rescue afterwards - all identical to the pre-run dump, and the patch-0088 watchdog never
+  fired).
+
+### Why the persistent log still does not work on topaz (investigated, NOT yet fixed)
+
+Chased this properly because without the ring every run costs a photo. Findings:
+- Window is right: `UFS_BLOCK` 4096, `SWEET_LOG_SIZE` 4 MiB -> ring = last 1025 blocks of the partition
+  = bytes 115,225,731,072..115,229,929,472 of userdata. Read exactly that from recovery: **no
+  `SWEETLOG` header** (also searched the last 64 MiB, and `grep -a` over the whole 16 GiB image local).
+- `sweet_log_start()` is called from `sweet_ufs_init()` right after the `SWEET UFS: "%s" on LUN ...`
+  print, and `su.writable = (rw != 0)` is set in that same init before the print (patch 0030, kept by
+  0069 and 0080), so the ordering is fine and `ufsrw=1` is in the cmdline.
+- **Ruled out the obvious suspect:** patch 0088's fence rejects writes at `lba < 6` and at
+  `lba + count - 1 >= gpt_alt - 4`. Computed from the dump: `userdata` is lba 2565160..30697466,
+  `gpt_alt` = 30697471, so the fence starts at 30697467 and the ring's last block is 30697466 - **the
+  two ranges touch but do not overlap** (checked for chunk sizes 1..1024: all sizes land at or below
+  30697466). So the guard does NOT block the ring. The fence and the ring only *just* fit, though -
+  any future change that moves either by one block will break the log, worth a comment in the code.
+- So the remaining candidates are the ones I could not settle without the phone: `sweet_log_start()`
+  failing `su.writable`/`nblocks`, or `kernel_thread_start` failing, or a first `ufs_write_blocks`
+  returning non-zero (`SWEET LOG: write failed (%d), stopping` would print to the panel - **ask the
+  operator whether that line was on screen for 10+ seconds during a run**; nobody has looked for it yet).
+
+### Harness notes for the next agent (learned the hard way on this phone)
+
+- **`fastboot boot` of the 100 MiB OrangeFox image worked the first time and then failed permanently**
+  with `Failed to load/authenticate boot image: Bad Buffer Size`. `fastboot reboot bootloader` does not
+  clear it. Do not burn the user's time retrying it - either flash the image to `recovery_b` (or `_a`)
+  or use the phone's own recovery.
+- **`fastboot reboot fastboot` (fastbootd) fails** on this phone while the slot has no bootable
+  userspace: "one or more components might be unbootable". So fastbootd is not a fallback for reading
+  partitions either.
+- **OrangeFox switches `current-slot`**: it was `b` (RisingOS) before the first temp-boot and `a`
+  afterwards. This is normal A/B recovery behaviour but it means **after any recovery session the
+  Android slot can be wrong** - run `fastboot getvar current-slot` and `fastboot set_active b` before
+  handing the phone back (`set_active` is the only supported way; never edit GPT attributes).
+  This was done: the phone was left on slot **b** with the Android install intact.
+- The phone's `recovery_a`/`recovery_b` (104,857,600 B each) and `boot_a`/`boot_b` (134,217,728 B each)
+  were **never written to** in this session; only `userdata` (the iOS root image) was.
+
+**Next steps (revised, in order):**
+1. Get the persistent log working (see above) - ask about the `SWEET LOG: write failed` line first, it
+   is the cheapest possible answer. Without the ring, debugging means photographing the panel.
+2. Then chase `securityd`/AKS selector 10 and whatever it waits on, and the `exec`-line sequence after
+   the first presentation (the DND client bundle is a red herring).
+3. Try `cpus=1` as an isolation run if a hang is suspected in a multi-core path (README lists it as the
+   safe fallback).
+4. Consider `mkadt.py --midmem` instead of `--highmem` (see the note at the top) if memory/display
+   behaviour looks wrong; it is a 10-second payload rebuild, not a re-flash.
+
 **Verified on this machine (observations):** CI run `39313254445` succeeded; the kernel is Mach-O
 arm64 with 0 LSE/LDAPR instructions and contains `SWEET UFS`, `SWEET FB`, `SWEET TOUCH`, `TopazModem`
 strings; the boot-header v4 fields above; all sha256s above; the OrangeFox ramdisk contents.
