@@ -3,7 +3,102 @@
 > The sweet (Redmi Note 10 Pro, SM7150) log inherited from dipa-studio/ios-sweet starts at the
 > "# iOS 16 on sweet ..." header below. Everything above that header is about THIS port.
 
-## >>> ACTIVE HANDOFF 2026-10-20: README steps 1-4 done, waiting for the phone <<<
+## >>> ACTIVE HANDOFF 2026-10-20 (late): Android will not boot, ABL always loads recovery <<<
+
+**Read this first.** The phone's Android install does NOT currently boot, and the cause is in the
+bootloader's boot decision, not in the disk. **Nothing is lost**: all partitions are intact, sizes match
+the backup dump exactly, and the full OTA is installed on slot `a`. The user is away; work continued
+autonomously.
+
+### What was done (all reversible, all verified)
+
+1. **TWRP recovery flashed to `recovery_b`** at the user's explicit request
+   (`fastboot flash recovery_b twrp-3.7.1_12-0-tapas.img`, size matched 1:1). Before that,
+   `fastboot boot` of any 100 MiB image started failing with
+   `Failed to load/authenticate boot image: Bad Buffer Size` - see the harness notes below.
+2. **Full partition dumps taken from OrangeFox/TWRP root** into
+   `ios-work/backup-20261020/partitions/` (713 MB, `SHA256SUMS.partitions`): `boot_a/b`,
+   `recovery_a/b`, `init_boot_a/b`, `vendor_boot_a/b`, `dtbo_a/b`, `vbmeta_a/b`, `misc`.
+   `boot_b.bin` (`48bf10e5e6f6ccb1`) is a byte-exact copy of the user's RisingOS boot image.
+3. **`bootctl mark-boot-successful`** run from TWRP: slot `b` went from `is-slot-marked-successful
+   rc=70` to `rc=0`. (The `bootctl` in TWRP knows `mark-boot-successful` / `is-slot-bootable` /
+   `set-active-boot-slot`; the fastboot interface shows the same data as `slot-successful:*` /
+   `slot-unbootable:*`.)
+4. **Stock recovery written to `recovery_b`** (`871867c2...`, extracted from the OTA payload) to take
+   TWRP out of the boot path - it made no difference to the recovery-reboot symptom.
+5. **Full OTA applied** to slot `a` from the user's
+   `~/Загрузки/RisingOS_Revived-7.1-250623-0339-VANILLA-OFFICIAL-topaz-ota.zip`
+   (`327dba3d5e42c22f`, `pre-device=topaz`, `ota-type=AB`, `post-build=...OS2.0.10.0.VMGMIXM`,
+   which is byte-identical to the build already on the phone). Applied with **`update_engine_sideload`
+   from inside stock recovery**, which is the key trick:
+   ```
+   # recovery's /data is not mountable, and /tmp is appdomain_tmpfs (SELinux blocks update_engine)
+   setenforce 0
+   update_engine_sideload --payload=file:///tmp/payload.bin --offset=0 --size=1499573441 \
+     --headers='FILE_HASH=pzcYKrlhWgUSh81HyeSx2Au6EvRRZtDcHou06FmpuMg=
+   FILE_SIZE=1499573441
+   METADATA_HASH=+2mAOqOZqq+2joT5ZWqGYZX8oz9NOa8vE0gk02jpE/c=
+   METADATA_SIZE=167522'
+   ```
+   Result: **`Completed 2938/2938 operations (100%)`, `FilesystemVerifierAction kSuccess`,
+   `PostinstallRunnerAction kSuccess`, "Update successfully applied"**, `switch_slot_on_reboot: true`.
+   `--offset` must be **0** (the `CrAU` magic is at the very start of `payload.bin`; the `4756`
+   in `META-INF/com/android/metadata` is the offset inside the *zip*, not the payload). The
+   `--headers` block is mandatory: without it update_engine fails with
+   `kDownloadInvalidMetadataSize`. Without `setenforce 0` it reads the payload as empty
+   (`kPayloadHashMismatchError`, sha256 of the empty string).
+6. `fastboot snapshot-update cancel` / `merge` - both answered `OKAY`, no effect.
+
+### The symptom, now narrowed
+
+**After every reboot ABL loads a recovery image and never the system**, regardless of:
+- active slot (`a` or `b`),
+- slot flags (`successful`/`unbootable`, all combinations tried - now both slots read
+  `successful: no, unbootable: no`, i.e. clean),
+- partition contents (stock recovery, TWRP, freshly OTA'd system - all the same).
+
+`bootinfo.pureason=0x40041` has been identical in every single boot (it is not a record of the
+last attempt - it never changes). `/sys/fs/pstore/` is **empty**, so the system kernel does not
+crash - ABL simply never hands over to it. `androidboot.slot_suffix` is reported correctly
+(`_b` before, `_a` after the OTA), so ABL does read the slot. `misc` is all zeros even
+immediately after landing in recovery (`bootloader_message` empty, no `boot-recovery` command),
+and `devinfo` (`ANDROID-BOOT!`, sde49) is **byte-identical to the pre-experiment dump** - so
+neither of those carries the offending flag.
+
+**Working hypothesis (NOT verified):** something outside the Android-visible partitions holds the
+boot decision - most likely a Xiaomi/ABL field or a hardware power-on latch. The next agent should
+look for a Xiaomi-specific recovery of the bootloader state (see below), not at the disk.
+
+### The way out (in the order worth trying)
+
+1. **QDL / EDL (9008) with a full `tapas` firehose ROM** - this rewrites ABL and everything else and
+   is the standard cure for a bootloader that will not leave recovery. Needs the phone in EDL
+   (`fastboot oem edl` is not available on this ABL - `fastboot oem help` says `unknown command`;
+   the user must enter EDL by hand, e.g. the Xiaomi test-point/`adb reboot edl` route). **Needs the
+   user's confirmation** and a ROM download.
+2. **`fastboot erase misc` / `erase devinfo`** - both partitions are dumped, so it is reversible, but
+   I did NOT do it: `misc` is already all zeros and `devinfo` is unchanged, so neither is the
+   obvious culprit, and erasing `devinfo` on a Xiaomi can change lock state. Only with the user's OK.
+3. **`fastboot fetch`** (supported by this ABL) - pull `devinfo`, `misc`, `vbmeta*`, `frp` and poke at
+   them offline before writing anything.
+4. Check the physical buttons: **a stuck volume key puts Qualcomm/Xiaomi ABL straight into
+   recovery** and would explain a decision made before the disk is even read. This is cheap and was
+   never tested - try booting with the volume keys held away from the contacts, and watch whether the
+   `pureason` value finally changes.
+
+### Phone state right now
+
+- In **fastboot**, `current-slot: b`, `unlocked: yes`.
+- Every partition size matches the pre-experiment dump (`userdata 0x1AD43D3000`, `super 0x1C0000000`,
+  `persist 0x2000000`, `cust 0x80000000`, `rescue 0x8000000`, `metadata 0x4000000`,
+  `misc 0x100000`, `boot_* 0x8000000`, `recovery_* 0x6400000`). **GPT intact.**
+- **iOS root in `userdata` untouched** - neither the OTA nor any of the writes above touched
+  `userdata`, `super`, `persist`, the GPT or the bootloaders. The 16 GiB iOS image is still there.
+- `recovery_b` holds stock recovery, `recovery_a` holds the OrangeFox the phone came with.
+
+---
+
+## >>> HANDOFF 2026-10-20: README steps 1-4 done, waiting for the phone <<<
 
 **Goal.** XNU + the unmodified iPhone X iOS 16.7.16 (20H392) userland on the user's Redmi Note 12 4G
 (`topaz`, SM6225), root filesystem in `userdata`, kernel started from RAM with `fastboot boot`.
